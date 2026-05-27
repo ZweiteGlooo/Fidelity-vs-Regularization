@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import ndimage
@@ -16,7 +20,38 @@ from skimage.transform import resize
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT_DIR = ROOT / "docs" / "Original"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
-DEFAULT_IMAGE_NAME = "couple.tif"
+DEFAULT_IMAGE_NAME = "5.1.14.tiff"
+IMAGE_EXTENSIONS = (".tif", ".tiff")
+DEFAULT_QUALITY_PRESET = "visual"
+QUALITY_PRESETS = {
+    "fast": {
+        "lambda_min": 1e-6,
+        "lambda_max": 1e-1,
+        "lambda_count": 12,
+        "epsilon_count": 8,
+        "epsilon_refine_steps": 3,
+        "max_iter": 80,
+    },
+    "balanced": {
+        "lambda_min": 1e-6,
+        "lambda_max": 1e-1,
+        "lambda_count": 24,
+        "epsilon_count": 14,
+        "epsilon_refine_steps": 5,
+        "max_iter": 160,
+    },
+    "visual": {
+        "lambda_min": 1e-8,
+        "lambda_max": 1e0,
+        "lambda_count": 60,
+        "epsilon_count": 20,
+        "epsilon_refine_steps": 6,
+        "max_iter": 400,
+    },
+}
+
+Matrix = np.ndarray
+Vector = np.ndarray
 
 
 @dataclass
@@ -28,6 +63,10 @@ class Candidate:
     noise_penalty: float
     objective_value: float
     cg_info: int
+    method: str = "weighted"
+    epsilon_bound: float | None = None
+    reference_mse: float | None = None
+    reference_psnr: float | None = None
     is_pareto: bool = False
     compromise_score: float | None = None
     is_best_compromise: bool = False
@@ -44,7 +83,7 @@ def parse_args() -> argparse.Namespace:
         "image",
         nargs="?",
         help=(
-            "Image filename or path to process, for example baboon.tif. "
+            "Image filename or path to process, for example 5.1.12.tiff. "
             f"If omitted, the script uses {DEFAULT_IMAGE_NAME}."
         ),
     )
@@ -54,15 +93,57 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--sigma-blur", type=float, default=2.0)
     parser.add_argument("--noise-level", type=float, default=0.01)
-    parser.add_argument("--lambda-min", type=float, default=1e-6)
-    parser.add_argument("--lambda-max", type=float, default=1e-1)
-    parser.add_argument("--lambda-count", type=int, default=24)
-    parser.add_argument("--max-iter", type=int, default=160)
+    parser.add_argument(
+        "--quality-preset",
+        choices=tuple(QUALITY_PRESETS),
+        default=DEFAULT_QUALITY_PRESET,
+        help=(
+            "Preset for the same MOLS/Tikhonov search. 'visual' uses a wider, "
+            "denser lambda grid and more CG iterations; 'balanced' keeps the "
+            "older defaults; 'fast' is for quick tests."
+        ),
+    )
+    parser.add_argument("--lambda-min", type=float, default=None)
+    parser.add_argument("--lambda-max", type=float, default=None)
+    parser.add_argument("--lambda-count", type=int, default=None)
+    parser.add_argument(
+        "--mols-method",
+        choices=("weighted", "epsilon"),
+        default="epsilon",
+        help=(
+            "'weighted' solves J1 + lambda J2 over a lambda grid. "
+            "'epsilon' solves min J1 subject to J2 <= epsilon by refining "
+            "points on the same Tikhonov path."
+        ),
+    )
+    parser.add_argument("--epsilon-count", type=int, default=None)
+    parser.add_argument("--epsilon-refine-steps", type=int, default=None)
+    parser.add_argument("--max-iter", type=int, default=None)
     parser.add_argument("--seed", type=int, default=7)
-    return parser.parse_args()
+    parser.add_argument(
+        "--best-selection",
+        choices=("reference", "compromise"),
+        default="reference",
+        help=(
+            "How to choose the highlighted Pareto reconstruction. "
+            "'reference' selects the Pareto image closest to the original; "
+            "'compromise' selects the normalized objective-space compromise."
+        ),
+    )
+    args = parser.parse_args()
+    apply_quality_preset(args)
+    return args
 
 
-def load_grayscale_image(path: Path, image_size: int) -> np.ndarray:
+def apply_quality_preset(args: argparse.Namespace) -> None:
+    preset = QUALITY_PRESETS[args.quality_preset]
+    for name, value in preset.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+
+
+def load_grayscale_image(path: Path, image_size: int) -> Matrix:
+    """Return the image as a real matrix X in [0, 1]^(m x n)."""
     image = img_as_float(io.imread(path))
     if image.ndim == 3:
         if image.shape[-1] == 4:
@@ -79,27 +160,45 @@ def load_grayscale_image(path: Path, image_size: int) -> np.ndarray:
     ).astype(np.float64)
 
 
+def vectorize(matrix: Matrix) -> Vector:
+    """vec(X): stack the image matrix into a vector."""
+    return matrix.ravel()
+
+
+def matrixize(vector: Vector, shape: tuple[int, int]) -> Matrix:
+    """vec^{-1}(x): reshape the vector solution back into an image matrix."""
+    return vector.reshape(shape)
+
+
+def squared_l2_norm(vector: Vector) -> float:
+    """||v||_2^2."""
+    return float(np.linalg.norm(vector) ** 2)
+
+
 def blur_operator(shape: tuple[int, int], sigma: float):
-    def blur(x: np.ndarray) -> np.ndarray:
+    """Linear blur operator A applied to vec(X)."""
+
+    def A(x: Vector) -> Vector:
         return ndimage.gaussian_filter(
-            x.reshape(shape),
+            matrixize(x, shape),
             sigma=sigma,
             mode="reflect",
         ).ravel()
 
-    return blur
+    return A
 
 
-def laplacian_operator(x: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
-    image = x.reshape(shape)
-    laplacian = (
-        -4.0 * image
-        + np.roll(image, 1, axis=0)
-        + np.roll(image, -1, axis=0)
-        + np.roll(image, 1, axis=1)
-        + np.roll(image, -1, axis=1)
+def laplacian_operator(x: Vector, shape: tuple[int, int]) -> Vector:
+    """Discrete roughness operator L applied to vec(X)."""
+    X = matrixize(x, shape)
+    LX = (
+        -4.0 * X
+        + np.roll(X, 1, axis=0)
+        + np.roll(X, -1, axis=0)
+        + np.roll(X, 1, axis=1)
+        + np.roll(X, -1, axis=1)
     )
-    return laplacian.ravel()
+    return vectorize(LX)
 
 
 def regularization_grid(lambda_min: float, lambda_max: float, count: int) -> np.ndarray:
@@ -115,64 +214,234 @@ def regularization_grid(lambda_min: float, lambda_max: float, count: int) -> np.
 def solve_tikhonov_candidate(
     index: int,
     lambda_reg: float,
-    y: np.ndarray,
+    Y: Matrix,
     shape: tuple[int, int],
-    blur,
+    A,
     max_iter: int,
+    x0: Vector | None = None,
+    method: str = "weighted",
+    epsilon_bound: float | None = None,
 ) -> Candidate:
-    y_flat = y.ravel()
-    n = y_flat.size
+    y = vectorize(Y)
+    n = y.size
 
     # Weighted MOLS scalarization:
-    # min_x J_1(x) + lambda J_2(x)
-    #   J_1(x) = ||Ax - y||^2,     data fidelity
-    #   J_2(x) = ||Lx||^2,         Tikhonov/Laplacian regularization
+    #   min_x Phi_lambda(x) = J_1(x) + lambda J_2(x)
+    #   J_1(x) = ||A x - y||_2^2       (data fidelity)
+    #   J_2(x) = ||L x||_2^2           (Tikhonov roughness penalty)
+    #
     # Normal equations:
-    #   (A^T A + lambda L^T L)x = A^T y.
-    # Gaussian blur and this Laplacian stencil are self-adjoint under the
-    # boundary model used here, so A^T and L^T are applied by the same routines.
-    def matvec(x: np.ndarray) -> np.ndarray:
-        ata_x = blur(blur(x))
-        ltl_x = laplacian_operator(laplacian_operator(x, shape), shape)
-        return ata_x + lambda_reg * ltl_x
+    #   (A^T A + lambda L^T L) x = A^T y.
+    #
+    # With reflective Gaussian blur and the symmetric Laplacian stencil used
+    # here, A^T and L^T are applied by the same operators as A and L.
+    L = lambda x: laplacian_operator(x, shape)
 
-    normal_matrix = LinearOperator((n, n), matvec=matvec)
-    rhs = blur(y_flat)
+    def normal_equation_matrix_vector_product(x: Vector) -> Vector:
+        return A(A(x)) + lambda_reg * L(L(x))
+
+    normal_matrix = LinearOperator(
+        (n, n),
+        matvec=normal_equation_matrix_vector_product,
+    )
+    rhs = A(y)
     x_hat, info = cg(
         normal_matrix,
         rhs,
-        x0=y_flat.copy(),
+        x0=y.copy() if x0 is None else x0.copy(),
         maxiter=max_iter,
         rtol=1e-5,
     )
 
-    image = np.clip(x_hat.reshape(shape), 0.0, 1.0)
-    residual = blur(image.ravel()) - y_flat
-    roughness = laplacian_operator(image.ravel(), shape)
-    fidelity_error = float(np.linalg.norm(residual) ** 2)
-    noise_penalty = float(np.linalg.norm(roughness) ** 2)
+    X_hat = np.clip(matrixize(x_hat, shape), 0.0, 1.0)
+    x_hat_clipped = vectorize(X_hat)
+    residual = A(x_hat_clipped) - y
+    roughness = L(x_hat_clipped)
+    fidelity_error = squared_l2_norm(residual)
+    noise_penalty = squared_l2_norm(roughness)
 
     return Candidate(
         index=index,
         lambda_reg=float(lambda_reg),
-        image=image,
+        image=X_hat,
         fidelity_error=fidelity_error,
         noise_penalty=noise_penalty,
         objective_value=fidelity_error + float(lambda_reg) * noise_penalty,
         cg_info=info,
+        method=method,
+        epsilon_bound=epsilon_bound,
     )
 
 
+def solve_weighted_path(
+    lambdas: np.ndarray,
+    Y: Matrix,
+    shape: tuple[int, int],
+    A,
+    max_iter: int,
+) -> list[Candidate]:
+    candidates: list[Candidate] = []
+    x0: Vector | None = None
+    for index, lambda_reg in enumerate(lambdas):
+        candidate = solve_tikhonov_candidate(
+            index=index,
+            lambda_reg=lambda_reg,
+            Y=Y,
+            shape=shape,
+            A=A,
+            max_iter=max_iter,
+            x0=x0,
+            method="weighted",
+        )
+        candidates.append(candidate)
+        x0 = vectorize(candidate.image)
+    return candidates
+
+
+def epsilon_grid(min_epsilon: float, max_epsilon: float, count: int) -> np.ndarray:
+    if count < 2:
+        raise ValueError("epsilon-count must be at least 2.")
+    min_epsilon = max(float(min_epsilon), np.finfo(float).tiny)
+    max_epsilon = max(float(max_epsilon), min_epsilon * (1.0 + 1e-12))
+    return np.geomspace(min_epsilon, max_epsilon, count)
+
+
+def candidate_for_epsilon(
+    epsilon: float,
+    lambda_low: float,
+    lambda_high: float,
+    Y: Matrix,
+    shape: tuple[int, int],
+    A,
+    max_iter: int,
+    refine_steps: int,
+    index: int,
+    x0: Vector,
+) -> Candidate:
+    low = float(lambda_low)
+    high = float(lambda_high)
+    best_feasible: Candidate | None = None
+    current_x0 = x0
+
+    for _ in range(refine_steps):
+        mid = float(np.sqrt(low * high))
+        candidate = solve_tikhonov_candidate(
+            index=index,
+            lambda_reg=mid,
+            Y=Y,
+            shape=shape,
+            A=A,
+            max_iter=max_iter,
+            x0=current_x0,
+            method="epsilon",
+            epsilon_bound=epsilon,
+        )
+        current_x0 = vectorize(candidate.image)
+        if candidate.noise_penalty <= epsilon:
+            best_feasible = candidate
+            high = mid
+        else:
+            low = mid
+
+    if best_feasible is None:
+        best_feasible = solve_tikhonov_candidate(
+            index=index,
+            lambda_reg=high,
+            Y=Y,
+            shape=shape,
+            A=A,
+            max_iter=max_iter,
+            x0=current_x0,
+            method="epsilon",
+            epsilon_bound=epsilon,
+        )
+    best_feasible.index = index
+    best_feasible.method = "epsilon"
+    best_feasible.epsilon_bound = epsilon
+    best_feasible.objective_value = best_feasible.fidelity_error
+    return best_feasible
+
+
+def solve_epsilon_path(
+    anchor_candidates: list[Candidate],
+    Y: Matrix,
+    shape: tuple[int, int],
+    A,
+    max_iter: int,
+    epsilon_count: int,
+    refine_steps: int,
+) -> list[Candidate]:
+    anchors = sorted(anchor_candidates, key=lambda candidate: candidate.lambda_reg)
+    roughness_values = np.array([candidate.noise_penalty for candidate in anchors])
+    epsilons = epsilon_grid(float(roughness_values.min()), float(roughness_values.max()), epsilon_count)
+    epsilon_candidates: list[Candidate] = []
+
+    for index, epsilon in enumerate(epsilons):
+        feasible = [candidate for candidate in anchors if candidate.noise_penalty <= epsilon]
+        if not feasible:
+            anchor = max(anchors, key=lambda candidate: candidate.lambda_reg)
+            candidate = solve_tikhonov_candidate(
+                index=index,
+                lambda_reg=anchor.lambda_reg,
+                Y=Y,
+                shape=shape,
+                A=A,
+                max_iter=max_iter,
+                x0=vectorize(anchor.image),
+                method="epsilon",
+                epsilon_bound=float(epsilon),
+            )
+        else:
+            feasible_index, first_feasible = min(
+                (
+                    (candidate_index, candidate)
+                    for candidate_index, candidate in enumerate(anchors)
+                    if candidate.noise_penalty <= epsilon
+                ),
+                key=lambda item: item[1].lambda_reg,
+            )
+            if feasible_index == 0:
+                candidate = solve_tikhonov_candidate(
+                    index=index,
+                    lambda_reg=first_feasible.lambda_reg,
+                    Y=Y,
+                    shape=shape,
+                    A=A,
+                    max_iter=max_iter,
+                    x0=vectorize(first_feasible.image),
+                    method="epsilon",
+                    epsilon_bound=float(epsilon),
+                )
+            else:
+                previous = anchors[feasible_index - 1]
+                candidate = candidate_for_epsilon(
+                    epsilon=float(epsilon),
+                    lambda_low=previous.lambda_reg,
+                    lambda_high=first_feasible.lambda_reg,
+                    Y=Y,
+                    shape=shape,
+                    A=A,
+                    max_iter=max_iter,
+                    refine_steps=refine_steps,
+                    index=index,
+                    x0=vectorize(first_feasible.image),
+                )
+        epsilon_candidates.append(candidate)
+
+    return epsilon_candidates
+
+
 def mark_pareto_front(candidates: list[Candidate]) -> None:
-    objectives = np.array(
+    # Objective matrix F has rows F_i = (J_1(x_i), J_2(x_i)).
+    F = np.array(
         [[candidate.fidelity_error, candidate.noise_penalty] for candidate in candidates],
         dtype=np.float64,
     )
     tolerance = 1e-12
 
     for i, candidate in enumerate(candidates):
-        no_worse = np.all(objectives <= objectives[i] + tolerance, axis=1)
-        strictly_better = np.any(objectives < objectives[i] - tolerance, axis=1)
+        no_worse = np.all(F <= F[i] + tolerance, axis=1)
+        strictly_better = np.any(F < F[i] - tolerance, axis=1)
         candidate.is_pareto = not bool(np.any(no_worse & strictly_better))
 
 
@@ -181,14 +450,14 @@ def mark_best_compromise(candidates: list[Candidate]) -> Candidate:
     if not pareto:
         raise ValueError("No Pareto candidates were found.")
 
-    objectives = np.array(
+    F = np.array(
         [[candidate.fidelity_error, candidate.noise_penalty] for candidate in pareto],
         dtype=np.float64,
     )
-    ideal = objectives.min(axis=0)
-    nadir = objectives.max(axis=0)
+    ideal = F.min(axis=0)
+    nadir = F.max(axis=0)
     span = np.where(nadir > ideal, nadir - ideal, 1.0)
-    normalized = (objectives - ideal) / span
+    normalized = (F - ideal) / span
     scores = np.linalg.norm(normalized, axis=1)
 
     best_index = int(np.argmin(scores))
@@ -198,16 +467,54 @@ def mark_best_compromise(candidates: list[Candidate]) -> Candidate:
     return pareto[best_index]
 
 
+def mark_reference_quality(candidates: list[Candidate], original: Matrix) -> None:
+    for candidate in candidates:
+        mse = float(np.mean((candidate.image - original) ** 2))
+        candidate.reference_mse = mse
+        candidate.reference_psnr = float("inf") if mse == 0 else float(-10.0 * np.log10(mse))
+
+
+def mark_selected_pareto_candidate(
+    candidates: list[Candidate],
+    original: Matrix,
+    selection: str,
+) -> Candidate:
+    pareto = [candidate for candidate in candidates if candidate.is_pareto]
+    if not pareto:
+        raise ValueError("No Pareto candidates were found.")
+
+    for candidate in candidates:
+        candidate.is_best_compromise = False
+
+    mark_reference_quality(candidates, original)
+    compromise = mark_best_compromise(candidates)
+    compromise.is_best_compromise = False
+
+    if selection == "compromise":
+        selected = compromise
+    elif selection == "reference":
+        selected = min(pareto, key=lambda candidate: candidate.reference_mse)
+    else:
+        raise ValueError(f"Unknown best-selection mode: {selection}")
+
+    selected.is_best_compromise = True
+    return selected
+
+
 def write_metrics_csv(path: Path, candidates: list[Candidate]) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(
             [
                 "index",
+                "method",
                 "lambda_reg",
+                "epsilon_bound",
                 "is_pareto",
                 "is_best_compromise",
                 "compromise_score",
+                "reference_mse",
+                "reference_psnr",
                 "fidelity_error",
                 "noise_penalty",
                 "weighted_objective",
@@ -218,10 +525,14 @@ def write_metrics_csv(path: Path, candidates: list[Candidate]) -> None:
             writer.writerow(
                 [
                     candidate.index,
+                    candidate.method,
                     candidate.lambda_reg,
+                    candidate.epsilon_bound,
                     candidate.is_pareto,
                     candidate.is_best_compromise,
                     candidate.compromise_score,
+                    candidate.reference_mse,
+                    candidate.reference_psnr,
                     candidate.fidelity_error,
                     candidate.noise_penalty,
                     candidate.objective_value,
@@ -230,7 +541,33 @@ def write_metrics_csv(path: Path, candidates: list[Candidate]) -> None:
             )
 
 
-def save_pareto_plot(path: Path, candidates: list[Candidate]) -> None:
+def write_matrix(path: Path, matrix: Matrix) -> None:
+    """Store an image matrix both readably (CSV) and exactly (NumPy NPY)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savetxt(path.with_suffix(".csv"), matrix, delimiter=",", fmt="%.10f")
+    np.save(path.with_suffix(".npy"), matrix)
+
+
+def prepare_output_dir(output_dir: Path, input_dir: Path) -> None:
+    """Clear the selected output directory before writing a new experiment."""
+    output_path = output_dir.resolve()
+    protected_paths = {
+        ROOT.resolve(),
+        input_dir.resolve(),
+        input_dir.resolve().parent,
+    }
+    if output_path in protected_paths:
+        raise ValueError(f"Refusing to empty protected directory: {output_path}")
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    for child in output_path.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def save_pareto_plot(path: Path, candidates: list[Candidate], selection: str) -> None:
     dominated = [candidate for candidate in candidates if not candidate.is_pareto]
     pareto = [candidate for candidate in candidates if candidate.is_pareto]
     best = [candidate for candidate in candidates if candidate.is_best_compromise]
@@ -259,6 +596,11 @@ def save_pareto_plot(path: Path, candidates: list[Candidate]) -> None:
         label="Pareto-optimal solution",
     )
     if best:
+        best_label = (
+            "Closest Pareto image to original"
+            if selection == "reference"
+            else "Best normalized compromise"
+        )
         axis.scatter(
             [candidate.fidelity_error for candidate in best],
             [candidate.noise_penalty for candidate in best],
@@ -266,7 +608,7 @@ def save_pareto_plot(path: Path, candidates: list[Candidate]) -> None:
             edgecolors="black",
             marker="D",
             s=80,
-            label="Best normalized compromise",
+            label=best_label,
         )
 
     for candidate in pareto:
@@ -323,12 +665,14 @@ def save_best_compromise_grid(
     original: np.ndarray,
     blurred_noisy: np.ndarray,
     best: Candidate,
+    selection: str,
 ) -> None:
     figure, axes = plt.subplots(1, 3, figsize=(10, 4))
+    selected_label = "Closest Pareto to original" if selection == "reference" else "Best Pareto compromise"
     panels = [
         ("Original", original),
         ("Blurred + noise", blurred_noisy),
-        (f"Best Pareto compromise #{best.index}\nlambda={best.lambda_reg:.1e}", best.image),
+        (f"{selected_label} #{best.index}\nlambda={best.lambda_reg:.1e}", best.image),
     ]
 
     for axis, (panel_title, image) in zip(axes, panels):
@@ -351,13 +695,22 @@ def resolve_image_path(image_argument: str, input_dir: Path) -> Path:
     if direct_match.exists():
         return direct_match
 
-    stem_match = input_dir / f"{image_argument}.tif"
-    if stem_match.exists():
-        return stem_match
+    for extension in IMAGE_EXTENSIONS:
+        stem_match = input_dir / f"{image_argument}{extension}"
+        if stem_match.exists():
+            return stem_match
 
-    available = ", ".join(path.name for path in sorted(input_dir.glob("*.tif")))
+    available = ", ".join(path.name for path in available_image_paths(input_dir))
     raise FileNotFoundError(
         f"Could not find image '{image_argument}'. Available images: {available}"
+    )
+
+
+def available_image_paths(input_dir: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in input_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     )
 
 
@@ -368,40 +721,61 @@ def run_image_experiment(
     sigma_blur: float,
     noise_level: float,
     lambdas: np.ndarray,
+    mols_method: str,
+    epsilon_count: int,
+    epsilon_refine_steps: int,
     max_iter: int,
+    best_selection: str,
     rng: np.random.Generator,
 ) -> None:
     print(f"Processing {image_path.name}")
-    image_output_dir = output_dir / image_path.stem
-    image_output_dir.mkdir(parents=True, exist_ok=True)
+    image_output_dir = output_dir
+    matrix_output_dir = image_output_dir / "matrices"
+    matrix_output_dir.mkdir(parents=True, exist_ok=True)
 
     original = load_grayscale_image(image_path, image_size)
     shape = original.shape
-    blur = blur_operator(shape, sigma_blur)
+    A = blur_operator(shape, sigma_blur)
 
-    blurred = blur(original.ravel()).reshape(shape)
+    blurred = matrixize(A(vectorize(original)), shape)
     blurred_noisy = np.clip(
         blurred + noise_level * rng.standard_normal(shape),
         0.0,
         1.0,
     )
 
-    candidates = [
-        solve_tikhonov_candidate(
-            index=index,
-            lambda_reg=lambda_reg,
-            y=blurred_noisy,
+    weighted_candidates = solve_weighted_path(
+        lambdas=lambdas,
+        Y=blurred_noisy,
+        shape=shape,
+        A=A,
+        max_iter=max_iter,
+    )
+    if mols_method == "epsilon":
+        candidates = solve_epsilon_path(
+            anchor_candidates=weighted_candidates,
+            Y=blurred_noisy,
             shape=shape,
-            blur=blur,
+            A=A,
             max_iter=max_iter,
+            epsilon_count=epsilon_count,
+            refine_steps=epsilon_refine_steps,
         )
-        for index, lambda_reg in enumerate(lambdas)
-    ]
+    elif mols_method == "weighted":
+        candidates = weighted_candidates
+    else:
+        raise ValueError(f"Unknown MOLS method: {mols_method}")
+
     mark_pareto_front(candidates)
-    best_compromise = mark_best_compromise(candidates)
+    best_compromise = mark_selected_pareto_candidate(
+        candidates,
+        original,
+        best_selection,
+    )
     pareto_candidates = [candidate for candidate in candidates if candidate.is_pareto]
 
     plt.imsave(image_output_dir / "original.png", original, cmap="gray", vmin=0, vmax=1)
+    write_matrix(matrix_output_dir / "original", original)
     plt.imsave(
         image_output_dir / "blurred_noisy.png",
         blurred_noisy,
@@ -409,6 +783,8 @@ def run_image_experiment(
         vmin=0,
         vmax=1,
     )
+    write_matrix(matrix_output_dir / "blurred", blurred)
+    write_matrix(matrix_output_dir / "blurred_noisy", blurred_noisy)
 
     for candidate in candidates:
         if candidate.cg_info != 0:
@@ -423,6 +799,10 @@ def run_image_experiment(
             vmin=0.0,
             vmax=1.0,
         )
+        write_matrix(
+            matrix_output_dir / f"reconstruction_{candidate.index:02d}",
+            candidate.image,
+        )
 
     for candidate in pareto_candidates:
         plt.imsave(
@@ -432,6 +812,10 @@ def run_image_experiment(
             vmin=0.0,
             vmax=1.0,
         )
+        write_matrix(
+            matrix_output_dir / f"pareto_reconstruction_{candidate.index:02d}",
+            candidate.image,
+        )
 
     plt.imsave(
         image_output_dir / "best_pareto_compromise.png",
@@ -440,16 +824,17 @@ def run_image_experiment(
         vmin=0.0,
         vmax=1.0,
     )
+    write_matrix(matrix_output_dir / "best_pareto_compromise", best_compromise.image)
 
     write_metrics_csv(image_output_dir / "metrics.csv", candidates)
     write_metrics_csv(image_output_dir / "pareto_front.csv", pareto_candidates)
-    save_pareto_plot(image_output_dir / "pareto.png", candidates)
+    save_pareto_plot(image_output_dir / "pareto.png", candidates, best_selection)
     save_reconstruction_grid(
         image_output_dir / "summary.png",
         original,
         blurred_noisy,
         candidates,
-        title="Weighted MOLS deblurring candidates",
+        title=f"{mols_method.capitalize()} MOLS deblurring candidates",
     )
     save_reconstruction_grid(
         image_output_dir / "pareto_summary.png",
@@ -463,21 +848,28 @@ def run_image_experiment(
         original,
         blurred_noisy,
         best_compromise,
+        best_selection,
     )
 
     print(f"  Pareto-optimal candidates found: {len(pareto_candidates)}")
+    print(f"  MOLS method: {mols_method}")
     print(
-        f"  Best compromise candidate: #{best_compromise.index} "
+        f"  Selected Pareto candidate: #{best_compromise.index} "
         f"(lambda={best_compromise.lambda_reg:.3e})"
     )
+    if best_compromise.reference_mse is not None:
+        print(
+            f"  Reference MSE/PSNR: {best_compromise.reference_mse:.6e} / "
+            f"{best_compromise.reference_psnr:.2f} dB"
+        )
 
 
 def main() -> None:
     args = parse_args()
-    image_paths = sorted(args.input_dir.glob("*.tif"))
+    image_paths = available_image_paths(args.input_dir)
 
     if not image_paths:
-        raise FileNotFoundError(f"No .tif files found in {args.input_dir}")
+        raise FileNotFoundError(f"No .tif or .tiff files found in {args.input_dir}")
 
     if args.list_images:
         print("Available images:")
@@ -489,10 +881,20 @@ def main() -> None:
         args.image = DEFAULT_IMAGE_NAME
         print(f"No image selected. Using default image: {args.image}")
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     lambdas = regularization_grid(args.lambda_min, args.lambda_max, args.lambda_count)
     image_path = resolve_image_path(args.image, args.input_dir)
+    prepare_output_dir(args.output_dir, args.input_dir)
+    print(
+        f"Quality preset: {args.quality_preset} "
+        f"(lambda=[{args.lambda_min:.1e}, {args.lambda_max:.1e}], "
+        f"count={args.lambda_count}, max_iter={args.max_iter})"
+    )
+    if args.mols_method == "epsilon":
+        print(
+            f"Epsilon-constraint settings: count={args.epsilon_count}, "
+            f"refine_steps={args.epsilon_refine_steps}"
+        )
 
     run_image_experiment(
         image_path=image_path,
@@ -501,7 +903,11 @@ def main() -> None:
         sigma_blur=args.sigma_blur,
         noise_level=args.noise_level,
         lambdas=lambdas,
+        mols_method=args.mols_method,
+        epsilon_count=args.epsilon_count,
+        epsilon_refine_steps=args.epsilon_refine_steps,
         max_iter=args.max_iter,
+        best_selection=args.best_selection,
         rng=rng,
     )
 
