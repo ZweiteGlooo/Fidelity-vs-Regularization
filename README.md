@@ -377,6 +377,8 @@ only visual. A complete run produces:
 - an epsilon-constraint Pareto set extracted from those Tikhonov candidates;
 - side-by-side reconstruction grids in `outputs/summary.png` and
   `outputs/pareto_summary.png`;
+- the fidelity-vs-regularization curve for different `lambda` values in
+  `outputs/lambda_tradeoff.png`;
 - the objective-space Pareto front in `outputs/pareto.png`;
 - quantitative metrics along the Pareto front in `outputs/metric_tradeoffs.png`;
 - a compact report table in `outputs/experiment_summary.csv`;
@@ -424,6 +426,8 @@ Useful outputs:
 - `outputs/pareto_front.csv`: only non-dominated candidates.
 - `outputs/experiment_summary.csv`: representative Pareto candidates with
   metrics and interpretation.
+- `outputs/lambda_tradeoff.png`: fidelity and regularization behavior for
+  different values of `lambda`.
 - `outputs/pareto.png`: objective-space Pareto front.
 - `outputs/metric_tradeoffs.png`: PSNR, SSIM, and residual norm along the
   Pareto front.

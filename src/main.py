@@ -79,43 +79,18 @@ class Candidate:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Two-objective image deblurring as a Multi-Objective Least Squares "
-            "problem: minimize fidelity ||Ax-y||^2 and noise/roughness ||Lx||^2."
-        )
-    )
-    parser.add_argument(
-        "image",
-        nargs="?",
-        help=(
-            "Image filename or path to process, for example 5.1.12.tiff. "
-            f"If omitted, the script uses {DEFAULT_IMAGE_NAME}."
-        ),
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("image", nargs="?")
     parser.add_argument("--list-images", action="store_true")
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument(
-        "--image-size",
-        type=int,
-        default=DEFAULT_IMAGE_SIZE,
-        help=(
-            "Square working image size. The project requirement is 256x256, "
-            f"so the default is {DEFAULT_IMAGE_SIZE}."
-        ),
-    )
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
     parser.add_argument("--sigma-blur", type=float, default=2.0)
     parser.add_argument("--noise-level", type=float, default=0.01)
     parser.add_argument(
         "--quality-preset",
         choices=tuple(QUALITY_PRESETS),
         default=DEFAULT_QUALITY_PRESET,
-        help=(
-            "Preset for the same MOLS/Tikhonov search. 'visual' uses a wider, "
-            "denser lambda grid and more CG iterations; 'balanced' keeps the "
-            "older defaults; 'fast' is for quick tests."
-        ),
     )
     parser.add_argument("--lambda-min", type=float, default=None)
     parser.add_argument("--lambda-max", type=float, default=None)
@@ -124,11 +99,6 @@ def parse_args() -> argparse.Namespace:
         "--mols-method",
         choices=("weighted", "epsilon"),
         default="epsilon",
-        help=(
-            "'weighted' solves J1 + lambda J2 over a lambda grid. "
-            "'epsilon' solves min J1 subject to J2 <= epsilon by refining "
-            "points on the same Tikhonov path."
-        ),
     )
     parser.add_argument("--epsilon-count", type=int, default=None)
     parser.add_argument("--epsilon-refine-steps", type=int, default=None)
@@ -138,11 +108,6 @@ def parse_args() -> argparse.Namespace:
         "--best-selection",
         choices=("reference", "compromise"),
         default="reference",
-        help=(
-            "How to choose the highlighted Pareto reconstruction. "
-            "'reference' selects the Pareto image closest to the original; "
-            "'compromise' selects the normalized objective-space compromise."
-        ),
     )
     args = parser.parse_args()
     apply_quality_preset(args)
@@ -157,7 +122,6 @@ def apply_quality_preset(args: argparse.Namespace) -> None:
 
 
 def load_grayscale_image(path: Path, image_size: int) -> Matrix:
-    """Return the image as a real matrix X in [0, 1]^(m x n)."""
     if image_size <= 0:
         raise ValueError("image-size must be a positive integer.")
 
@@ -178,23 +142,18 @@ def load_grayscale_image(path: Path, image_size: int) -> Matrix:
 
 
 def vectorize(matrix: Matrix) -> Vector:
-    """vec(X): stack the image matrix into a vector."""
     return matrix.ravel()
 
 
 def matrixize(vector: Vector, shape: tuple[int, int]) -> Matrix:
-    """vec^{-1}(x): reshape the vector solution back into an image matrix."""
     return vector.reshape(shape)
 
 
 def squared_l2_norm(vector: Vector) -> float:
-    """||v||_2^2."""
     return float(np.linalg.norm(vector) ** 2)
 
 
 def blur_operator(shape: tuple[int, int], sigma: float):
-    """Linear blur operator A applied to vec(X)."""
-
     def A(x: Vector) -> Vector:
         return ndimage.gaussian_filter(
             matrixize(x, shape),
@@ -206,7 +165,6 @@ def blur_operator(shape: tuple[int, int], sigma: float):
 
 
 def laplacian_operator(x: Vector, shape: tuple[int, int]) -> Vector:
-    """Discrete roughness operator L applied to vec(X)."""
     X = matrixize(x, shape)
     LX = (
         -4.0 * X
@@ -242,16 +200,6 @@ def solve_tikhonov_candidate(
     y = vectorize(Y)
     n = y.size
 
-    # Weighted MOLS scalarization:
-    #   min_x Phi_lambda(x) = J_1(x) + lambda J_2(x)
-    #   J_1(x) = ||A x - y||_2^2       (data fidelity)
-    #   J_2(x) = ||L x||_2^2           (Tikhonov roughness penalty)
-    #
-    # Normal equations:
-    #   (A^T A + lambda L^T L) x = A^T y.
-    #
-    # With reflective Gaussian blur and the symmetric Laplacian stencil used
-    # here, A^T and L^T are applied by the same operators as A and L.
     L = lambda x: laplacian_operator(x, shape)
 
     def normal_equation_matrix_vector_product(x: Vector) -> Vector:
@@ -451,7 +399,6 @@ def solve_epsilon_path(
 
 
 def mark_pareto_front(candidates: list[Candidate]) -> None:
-    # Objective matrix F has rows F_i = (J_1(x_i), J_2(x_i)).
     F = np.array(
         [[candidate.fidelity_error, candidate.noise_penalty] for candidate in candidates],
         dtype=np.float64,
@@ -578,7 +525,6 @@ def write_metrics_csv(path: Path, candidates: list[Candidate]) -> None:
 
 
 def write_experiment_summary_csv(path: Path, candidates: list[Candidate]) -> None:
-    """Store a compact table for the report: representative Pareto solutions."""
     pareto = [candidate for candidate in candidates if candidate.is_pareto]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -639,14 +585,12 @@ def write_experiment_summary_csv(path: Path, candidates: list[Candidate]) -> Non
 
 
 def write_matrix(path: Path, matrix: Matrix) -> None:
-    """Store an image matrix both readably (CSV) and exactly (NumPy NPY)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savetxt(path.with_suffix(".csv"), matrix, delimiter=",", fmt="%.10f")
     np.save(path.with_suffix(".npy"), matrix)
 
 
 def prepare_output_dir(output_dir: Path, input_dir: Path) -> None:
-    """Clear the selected output directory before writing a new experiment."""
     output_path = output_dir.resolve()
     protected_paths = {
         ROOT.resolve(),
@@ -811,6 +755,51 @@ def save_metric_tradeoff_plot(path: Path, candidates: list[Candidate]) -> None:
         axis.grid(True, alpha=0.3)
 
     figure.suptitle("Quantitative metrics along the Pareto front")
+    figure.tight_layout()
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+
+
+def save_lambda_tradeoff_plot(path: Path, candidates: list[Candidate]) -> None:
+    lambdas = np.array([candidate.lambda_reg for candidate in candidates])
+    fidelity = np.array([candidate.fidelity_error for candidate in candidates])
+    regularization = np.array([candidate.noise_penalty for candidate in candidates])
+
+    order = np.argsort(lambdas)
+    lambdas = lambdas[order]
+    fidelity = fidelity[order]
+    regularization = regularization[order]
+
+    figure, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+    axes[0].semilogx(lambdas, fidelity, marker="o", color="royalblue", label="J1")
+    axes[0].semilogx(
+        lambdas,
+        regularization,
+        marker="s",
+        color="darkorange",
+        label="J2",
+    )
+    axes[0].set_xlabel("lambda")
+    axes[0].set_ylabel("objective value")
+    axes[0].set_title("Objectives for different lambda values")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(loc="best")
+
+    scatter = axes[1].scatter(
+        fidelity,
+        regularization,
+        c=np.log10(lambdas),
+        cmap="viridis",
+        s=55,
+    )
+    axes[1].plot(fidelity, regularization, color="0.5", linewidth=1.0, alpha=0.6)
+    axes[1].set_xlabel("fidelity J1 = ||Ax - y||^2")
+    axes[1].set_ylabel("regularization J2 = ||Lx||^2")
+    axes[1].set_title("Fidelity-regularization trade-off")
+    axes[1].grid(True, alpha=0.3)
+    colorbar = figure.colorbar(scatter, ax=axes[1])
+    colorbar.set_label("log10(lambda)")
+
     figure.tight_layout()
     figure.savefig(path, dpi=180)
     plt.close(figure)
@@ -985,6 +974,7 @@ def run_image_experiment(
     write_metrics_csv(image_output_dir / "pareto_front.csv", pareto_candidates)
     write_experiment_summary_csv(image_output_dir / "experiment_summary.csv", candidates)
     save_pareto_plot(image_output_dir / "pareto.png", candidates, best_selection)
+    save_lambda_tradeoff_plot(image_output_dir / "lambda_tradeoff.png", weighted_candidates)
     save_metric_tradeoff_plot(image_output_dir / "metric_tradeoffs.png", candidates)
     save_svd_explanation_figure(image_output_dir / "svd_regularization_explanation.png")
     save_reconstruction_grid(
