@@ -14,6 +14,7 @@ import numpy as np
 from scipy import ndimage
 from scipy.sparse.linalg import LinearOperator, cg
 from skimage import color, img_as_float, io
+from skimage.metrics import structural_similarity
 from skimage.transform import resize
 
 
@@ -21,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT_DIR = ROOT / "docs" / "Original"
 DEFAULT_OUTPUT_DIR = ROOT / "outputs"
 DEFAULT_IMAGE_NAME = "5.1.14.tiff"
+DEFAULT_IMAGE_SIZE = 256
 IMAGE_EXTENSIONS = (".tif", ".tiff")
 DEFAULT_QUALITY_PRESET = "visual"
 QUALITY_PRESETS = {
@@ -65,8 +67,12 @@ class Candidate:
     cg_info: int
     method: str = "weighted"
     epsilon_bound: float | None = None
+    residual_norm: float | None = None
+    roughness_norm: float | None = None
+    reference_error_norm: float | None = None
     reference_mse: float | None = None
     reference_psnr: float | None = None
+    reference_ssim: float | None = None
     is_pareto: bool = False
     compromise_score: float | None = None
     is_best_compromise: bool = False
@@ -90,7 +96,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list-images", action="store_true")
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=DEFAULT_IMAGE_SIZE,
+        help=(
+            "Square working image size. The project requirement is 256x256, "
+            f"so the default is {DEFAULT_IMAGE_SIZE}."
+        ),
+    )
     parser.add_argument("--sigma-blur", type=float, default=2.0)
     parser.add_argument("--noise-level", type=float, default=0.01)
     parser.add_argument(
@@ -144,6 +158,9 @@ def apply_quality_preset(args: argparse.Namespace) -> None:
 
 def load_grayscale_image(path: Path, image_size: int) -> Matrix:
     """Return the image as a real matrix X in [0, 1]^(m x n)."""
+    if image_size <= 0:
+        raise ValueError("image-size must be a positive integer.")
+
     image = img_as_float(io.imread(path))
     if image.ndim == 3:
         if image.shape[-1] == 4:
@@ -270,6 +287,8 @@ def solve_tikhonov_candidate(
         cg_info=info,
         method=method,
         epsilon_bound=epsilon_bound,
+        residual_norm=float(np.sqrt(fidelity_error)),
+        roughness_norm=float(np.sqrt(noise_penalty)),
     )
 
 
@@ -469,9 +488,18 @@ def mark_best_compromise(candidates: list[Candidate]) -> Candidate:
 
 def mark_reference_quality(candidates: list[Candidate], original: Matrix) -> None:
     for candidate in candidates:
-        mse = float(np.mean((candidate.image - original) ** 2))
+        reference_error = candidate.image - original
+        mse = float(np.mean(reference_error ** 2))
+        candidate.reference_error_norm = float(np.linalg.norm(reference_error))
         candidate.reference_mse = mse
         candidate.reference_psnr = float("inf") if mse == 0 else float(-10.0 * np.log10(mse))
+        candidate.reference_ssim = float(
+            structural_similarity(
+                original,
+                candidate.image,
+                data_range=1.0,
+            )
+        )
 
 
 def mark_selected_pareto_candidate(
@@ -513,11 +541,15 @@ def write_metrics_csv(path: Path, candidates: list[Candidate]) -> None:
                 "is_pareto",
                 "is_best_compromise",
                 "compromise_score",
+                "residual_norm",
+                "roughness_norm",
+                "reference_error_norm",
                 "reference_mse",
                 "reference_psnr",
+                "reference_ssim",
                 "fidelity_error",
                 "noise_penalty",
-                "weighted_objective",
+                "scalarized_or_primary_objective",
                 "cg_info",
             ]
         )
@@ -531,12 +563,77 @@ def write_metrics_csv(path: Path, candidates: list[Candidate]) -> None:
                     candidate.is_pareto,
                     candidate.is_best_compromise,
                     candidate.compromise_score,
+                    candidate.residual_norm,
+                    candidate.roughness_norm,
+                    candidate.reference_error_norm,
                     candidate.reference_mse,
                     candidate.reference_psnr,
+                    candidate.reference_ssim,
                     candidate.fidelity_error,
                     candidate.noise_penalty,
                     candidate.objective_value,
                     candidate.cg_info,
+                ]
+            )
+
+
+def write_experiment_summary_csv(path: Path, candidates: list[Candidate]) -> None:
+    """Store a compact table for the report: representative Pareto solutions."""
+    pareto = [candidate for candidate in candidates if candidate.is_pareto]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "index",
+                "lambda_reg",
+                "residual_norm",
+                "roughness_norm",
+                "reference_mse",
+                "reference_psnr",
+                "reference_ssim",
+                "interpretation",
+            ]
+        )
+        if not pareto:
+            return
+
+        selected_indexes = sorted(
+            {
+                0,
+                len(pareto) // 4,
+                len(pareto) // 2,
+                (3 * len(pareto)) // 4,
+                len(pareto) - 1,
+                next(
+                    (
+                        position
+                        for position, candidate in enumerate(pareto)
+                        if candidate.is_best_compromise
+                    ),
+                    len(pareto) // 2,
+                ),
+            }
+        )
+        for position in selected_indexes:
+            candidate = pareto[position]
+            if position == 0:
+                interpretation = "smoothest / strongest regularization"
+            elif position == len(pareto) - 1:
+                interpretation = "sharpest / weakest regularization"
+            elif candidate.is_best_compromise:
+                interpretation = "selected Pareto reconstruction"
+            else:
+                interpretation = "intermediate Pareto trade-off"
+            writer.writerow(
+                [
+                    candidate.index,
+                    candidate.lambda_reg,
+                    candidate.residual_norm,
+                    candidate.roughness_norm,
+                    candidate.reference_mse,
+                    candidate.reference_psnr,
+                    candidate.reference_ssim,
+                    interpretation,
                 ]
             )
 
@@ -578,7 +675,7 @@ def save_pareto_plot(path: Path, candidates: list[Candidate], selection: str) ->
             [candidate.fidelity_error for candidate in dominated],
             [candidate.noise_penalty for candidate in dominated],
             c="0.7",
-            label="Dominated weighted solution",
+            label="Dominated candidate",
         )
     axis.plot(
         [candidate.fidelity_error for candidate in pareto],
@@ -620,7 +717,7 @@ def save_pareto_plot(path: Path, candidates: list[Candidate], selection: str) ->
 
     axis.set_xlabel("Fidelity error J1 = ||Ax - y||^2")
     axis.set_ylabel("Noise control J2 = ||Lx||^2")
-    axis.set_title("Pareto front from weighted MOLS/Tikhonov solutions")
+    axis.set_title("Pareto front from MOLS/Tikhonov candidate solutions")
     axis.grid(True, alpha=0.3)
     axis.legend(loc="best")
     figure.tight_layout()
@@ -686,6 +783,63 @@ def save_best_compromise_grid(
     plt.close(figure)
 
 
+def save_metric_tradeoff_plot(path: Path, candidates: list[Candidate]) -> None:
+    pareto = [candidate for candidate in candidates if candidate.is_pareto]
+    if not pareto:
+        return
+
+    indexes = [candidate.index for candidate in pareto]
+    psnr = [candidate.reference_psnr for candidate in pareto]
+    ssim = [candidate.reference_ssim for candidate in pareto]
+    residual = [candidate.residual_norm for candidate in pareto]
+
+    figure, axes = plt.subplots(1, 3, figsize=(12, 3.8))
+    axes[0].plot(indexes, psnr, marker="o", color="seagreen")
+    axes[0].set_title("PSNR")
+    axes[0].set_ylabel("dB")
+
+    axes[1].plot(indexes, ssim, marker="o", color="royalblue")
+    axes[1].set_title("SSIM")
+    axes[1].set_ylim(0.0, 1.0)
+
+    axes[2].plot(indexes, residual, marker="o", color="darkorange")
+    axes[2].set_title("Residual norm")
+    axes[2].set_ylabel("||Ax - y||")
+
+    for axis in axes:
+        axis.set_xlabel("Pareto candidate index")
+        axis.grid(True, alpha=0.3)
+
+    figure.suptitle("Quantitative metrics along the Pareto front")
+    figure.tight_layout()
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+
+
+def save_svd_explanation_figure(path: Path) -> None:
+    sigma = np.logspace(0, -4, 240)
+    inverse_filter = 1.0 / sigma
+    lambda_reg = 1e-2
+    tikhonov_filter = sigma / (sigma**2 + lambda_reg)
+
+    figure, axis = plt.subplots(figsize=(7.5, 4.8))
+    axis.loglog(sigma, inverse_filter, label="Unregularized inverse: 1/sigma")
+    axis.loglog(
+        sigma,
+        tikhonov_filter,
+        label="Tikhonov filter: sigma / (sigma^2 + lambda)",
+    )
+    axis.invert_xaxis()
+    axis.set_xlabel("Singular value sigma")
+    axis.set_ylabel("Noise amplification factor")
+    axis.set_title("SVD view: regularization suppresses unstable small singular values")
+    axis.grid(True, which="both", alpha=0.3)
+    axis.legend(loc="best")
+    figure.tight_layout()
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+
+
 def resolve_image_path(image_argument: str, input_dir: Path) -> Path:
     candidate = Path(image_argument)
     if candidate.exists():
@@ -729,6 +883,7 @@ def run_image_experiment(
     rng: np.random.Generator,
 ) -> None:
     print(f"Processing {image_path.name}")
+    print(f"  Working grid: {image_size}x{image_size}")
     image_output_dir = output_dir
     matrix_output_dir = image_output_dir / "matrices"
     matrix_output_dir.mkdir(parents=True, exist_ok=True)
@@ -828,7 +983,10 @@ def run_image_experiment(
 
     write_metrics_csv(image_output_dir / "metrics.csv", candidates)
     write_metrics_csv(image_output_dir / "pareto_front.csv", pareto_candidates)
+    write_experiment_summary_csv(image_output_dir / "experiment_summary.csv", candidates)
     save_pareto_plot(image_output_dir / "pareto.png", candidates, best_selection)
+    save_metric_tradeoff_plot(image_output_dir / "metric_tradeoffs.png", candidates)
+    save_svd_explanation_figure(image_output_dir / "svd_regularization_explanation.png")
     save_reconstruction_grid(
         image_output_dir / "summary.png",
         original,
@@ -859,8 +1017,9 @@ def run_image_experiment(
     )
     if best_compromise.reference_mse is not None:
         print(
-            f"  Reference MSE/PSNR: {best_compromise.reference_mse:.6e} / "
-            f"{best_compromise.reference_psnr:.2f} dB"
+            f"  Reference MSE/PSNR/SSIM: {best_compromise.reference_mse:.6e} / "
+            f"{best_compromise.reference_psnr:.2f} dB / "
+            f"{best_compromise.reference_ssim:.4f}"
         )
 
 
